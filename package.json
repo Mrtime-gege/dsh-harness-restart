@@ -1,0 +1,83 @@
+{
+  "name": "dsh-harness-restart",
+  "version": "0.1.0",
+  "description": "Restart DeepSeek Harness from a settings page: restart button, restart policies (now / wait-idle / notify), AI permission switches with two-step challenge authentication, dsh_restart + dsh_restart_cancel tools, /restart command, in-settings log viewer with one-click open, environment-adaptive restart (supervisor self-exit vs detached respawn), post-restart auto-continue and credential-rotation self-healing.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.5-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "slots"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1",
+    "@deepseek-ai/dsh-llm": ">=0.0.1-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.0",
+    "react": "^18.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "cordis",
+    "restart",
+    "reboot",
+    "session-resume"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "check": "node --check lib/index.js && node --check lib/client.js && node --check lib/core.js",
+    "test": "node tests/unit.mjs",
+    "test:profile": "bash scripts/test-in-profile.sh",
+    "prepublishOnly": "npm run check && npm test"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

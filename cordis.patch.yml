@@ -1,0 +1,46 @@
+# dsh-harness-restart bundle patch —— 在 profile 根上插入一行插件。
+
+# host 半提供：
+#   * 模型工具 dsh_restart（受 aiRestartEnabled 开关与 confirm:true 守卫限制）
+#   * /restart 斜杠命令
+#   * 同源 HTTP 路由（本机/私有网段 + 同源守卫，核心 requestRejection 参与鉴权）：
+#       GET  /plugins/dsh-harness-restart/status    身份 + 策略状态 + 空闲快照 + 新凭证 url
+#       GET  /plugins/dsh-harness-restart/config    当前配置
+#       POST /plugins/dsh-harness-restart/config    写配置（settings.yaml）
+#       POST /plugins/dsh-harness-restart/restart   按策略重启
+#       POST /plugins/dsh-harness-restart/cancel    取消等待中的重启
+#       GET  /plugins/dsh-harness-restart/check     预检（只读）
+#   * 重启策略：now 立即 / wait-idle 等全部会话空闲 / notify 通知后等待
+#   * 重启前把「所有未完成会话」（进行中 turn ∪ 有活动 goal）写入恢复标记，
+#     新进程启动后逐个注入 continuePrompt 自动继续
+#   * 重启机制按运行时监管者自适应：
+#       - systemd / 容器（有失败重启策略的监管者）：体面地 exit 非零，监管者按原路径拉起
+#       - 裸跑（无监管者）：detach helper 自再拉起（纯 Node 标准库）
+#   * 凭证轮换自愈：/status 下发新进程 authenticatedUrl()，页面自动用新凭证重开
+# client 半提供：
+#   * 设置 →「DSH 重启」整页（按钮/策略/权限/实时状态，--dsw-alias-* 主题 token）
+#   * shell.overlay 重启进度遮罩（等待策略倒计时/重启中/自动重开）
+
+- insert:
+    - id: harness-restart
+      name: 'dsh-harness-restart'
+      config:
+        # 重启后向每个未完成会话注入的继续提示（统一以【DSH 系统】开头）
+        continuePrompt: '【DSH 系统】已重启完成。请检查本会话是否有未完成的工作或活动中的 goal：如有，先恢复/继续它，完成后再向用户简要报告恢复结果。'
+        # 旧进程退出前等待的毫秒数（给当前工具结果/消息留出落盘回传时间）
+        restartDelayMs: 2000
+        # 是否允许 AI 使用重启功能（关闭后 dsh_restart 一律拒绝；页面按钮不受影响）
+        aiRestartEnabled: true
+        # AI 发起重启需要二次认证：首次调用只返回 16 位随机认证串与引导，
+        # 二次调用携带并匹配该串后才真正重启
+        aiRestartChallenge: true
+        # 默认重启策略：now 立即 / wait-idle 等全部会话空闲 / notify 通知后等待
+        restartPolicy: now
+        # wait-idle 最长等待毫秒数，超时则取消（默认 10 分钟）
+        waitIdleTimeoutMs: 600000
+        # notify 策略注入给会话的提示词（{minutes} 替换为等待分钟数；统一以【DSH 系统】开头）
+        notifyPrompt: '【DSH 系统】DSH 将在约 {minutes} 分钟后重启。请尽快收尾当前工作、不要发起新的长任务；重启后未完成的工作会自动继续。'
+        # notify 策略注入提示词后的等待毫秒数（默认 5 分钟）
+        notifyWaitMs: 300000
+        # notify 策略下若全部会话提前空闲，是否立刻重启
+        notifyRestartWhenIdle: true
