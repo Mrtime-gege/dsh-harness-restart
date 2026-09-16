@@ -104,7 +104,7 @@ Then **restart DSH once** to activate (the plugin manages subsequent restarts it
 
 ## Credits
 
-- Restart mechanism, identity probe and auto-continue follow the patterns of [anweat/dsh-restart](https://github.com/anweat/dsh-restart) (MIT); the detached relaunch helper is an adaptation of its `relaunch-helper` — see [NOTICE](./NOTICE).
+- Restart mechanism, identity probe and auto-continue follow the patterns of [anweat/dsh-restart](https://github.com/anweat/dsh-restart) (MIT); the detached relaunch helper is an adaptation of its `relaunch-helper` (attribution is also embedded in `lib/core.js`; the full upstream MIT text lives in the dev repository's `NOTICE`).
 - Settings-page placement idea inspired by [1123762794/dsh-web-restart](https://github.com/1123762794/dsh-web-restart).
 
 ## License
