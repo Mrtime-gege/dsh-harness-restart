@@ -19,8 +19,7 @@
     "README.md",
     "SECURITY.md",
     "LICENSE",
-    "NOTICE",
-    ".npmrc"
+    "NOTICE"
   ],
   "engines": {
     "node": ">=20"
