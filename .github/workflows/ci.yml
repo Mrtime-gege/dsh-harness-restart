@@ -1,34 +1,52 @@
+# 持续集成：语法检查 → 发布不变量检查 → 打包试运行。
+#
+# 借鉴 dsh-agent-shell 项目经验：
+#   * 本仓库无 lockfile、无 devDependencies，依赖只有 peerDependencies，
+#     所以不用 npm ci/install（`npm run check` / `npm test` / `npm run release:check`
+#     都只依赖 Node 标准库 —— peer 依赖由 dsh 宿主提供，CI 不需要安装）。
+#   * Node 20/22 双版本矩阵：宿主 dsh 运行在 Node >=20，双版本验证兼容面。
+#   * 纯逻辑测试（72+11+11 断言）不依赖 dsh 进程，直接跑。
+#   * `npm pack --dry-run` 确认发布物内容与白名单一致。
+
 name: ci
 
 on:
   push:
-    branches: [dev, main]
+    branches: [dev, release, main]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   check:
+    name: 语法/测试/发布不变量（Node ${{ matrix.node }}）
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - '20'
+          - '22'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Syntax check
-        run: |
-          node --check lib/index.js
-          node --check lib/client.js
-          node --check lib/core.js
-      - name: Release invariants (version / CHANGELOG / files whitelist / leak scan)
-        run: node scripts/release-check.mjs
+      - name: 检出
+        uses: actions/checkout@v5
 
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: 配置 Node ${{ matrix.node }}
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
-      - name: Install the pinned DSH baseline (contains the runtime @deepseek-ai/* packages)
-        run: npm i -g @deepseek-ai/dsh@0.1.5-rc.1
-      - name: Isolated profile test (unit + boot smoke, no live instance touched)
-        run: bash scripts/test-in-profile.sh
+          node-version: ${{ matrix.node }}
+
+      - name: 语法检查
+        run: |
+          node -v
+          npm run check
+
+      - name: 纯逻辑测试（不依赖 dsh 进程）
+        run: npm test
+
+      - name: 发布不变量检查
+        run: npm run release:check
+
+      - name: 打包试运行（确认发布物内容）
+        run: npm pack --dry-run
