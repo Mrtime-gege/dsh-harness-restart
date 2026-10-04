@@ -1,112 +1,182 @@
 # dsh-harness-restart
 
-Restart the whole DeepSeek Harness process from a **settings page** (no sidebar button, no accidental clicks): restart button, three restart policies, AI permission switches with a **two-step challenge authentication**, `dsh_restart` + `dsh_restart_cancel` model tools, `/restart` command, an in-settings **log viewer** with one-click open, environment-adaptive restart (supervisor self-exit vs. detached respawn), post-restart **auto-continue** of unfinished sessions, and **credential-rotation self-healing** (the page reopens itself with the new token).
+A host plugin that **restarts the DeepSeek Harness (dsh) process and automatically continues unfinished work** — with an approval gate for AI-initiated restarts, schedule/script callbacks, a receipt-based progressive restore of registered callbacks (scheme B), a simulate-only drill mode, and a self-healing restart path that works both under a supervisor and in bare runs.
+
+Built and verified against **dsh 0.2.0** (tested on 0.2.0-rc.2; legacy v0.1.x config keys are mapped automatically).
+
+---
 
 ## Features
 
-- Settings → **“DSH 重启”** page (top → bottom: 权限 / 重启+策略 / 日志), styled with `--dsw-alias-*` theme tokens (light & dark).
-  - One-click **“重启（按当前策略）”** + **“取消等待中的重启”**.
-  - Three **restart policies** with live progress and a countdown mini-popup (bottom-right, non-blocking) showing **who initiated** the restart and **remaining time**.
-  - **“允许 AI 使用重启功能”** and **“AI 发起重启需要二次认证”** switches (enforced server-side).
-  - **日志** card: live tail, auto-refresh, one-click open of the source file.
-- **Model tool `dsh_restart`** — AI schedules a restart with **two-step authentication**: the first call returns a 16-char challenge token + guidance; the second call must echo the **same token and the exact same `policy`** — only then does the restart actually start. AI cannot use the `now` policy; waiting policies have a hard **3-minute minimum countdown**, and the user gets a bottom-right popup they can cancel.
-- **`dsh_restart_cancel`** — cancels a pending restart **only if the AI itself initiated it**.
-- **Post-restart auto-continue** — before restarting, all unfinished root sessions (in-flight turn ∪ active goal) are recorded in `$DSH_HOME/dsh-resume.json`; after boot each is injected with a “continue” prompt (followup for live agents, `sessionController.prompt` fallback for cold ones), then the marker is cleared.
-- **Credential-rotation self-healing** — dsh rotates its launch token every boot; the probe route hands the page the new `authenticatedUrl()` and the page reopens itself. Zero manual URL copying. Works for both page-initiated and AI-initiated restarts (while a page is open).
+- **Four-layer restart engine** — TRIGGER → APPROVAL → PRE → EXIT → POST:
+  1. **Trigger**: manual button/HTTP, AI tool, or schedule callbacks (official presets `now` / `delay` / `daily` / `weekly` / `immediate` / `waitSeconds` / `waitAllOrForce`, plus user **JavaScript callbacks** with full-trust warning + audit).
+  2. **Approval**: AI-initiated restarts require a two-step challenge (16-hex token must be echoed); AI is restricted to `delay` inside `ai.delayRangeMs` (default 3 min–1 h), `now` is off by default.
+  3. **PRE**: decide when to actually leave — `immediate`, `waitSeconds(N)`, or `waitAllOrForce` (idle-wait with force timeout; `-1` = wait forever). Sub-agents (subagent children, Agent Teams teammates) are part of the idle snapshot via `agents.list()`.
+  4. **EXIT → POST**: write the resume marker, then restart; after boot, restore unfinished sessions and progressive callback sessions.
+- **Receipt-based restore (scheme B)** — `dsh_restart_register_callback` lets any session register a “continue this task after restart” callback; after boot the plugin waits `bootRestoreDelayMs` (1 min), then wakes **one callback session every `restoreStaggerMs`** (5 s). Each restored session must ack via `dsh_restart_callback_done`; unacked callbacks get one reminder after `callbackUnackTimeoutMs` (30 min), then `callback-unacked`.
+- **AI tools** — `dsh_restart`, `dsh_restart_cancel`, `dsh_restart_register_callback`, `dsh_restart_callback_done`. Strict validation, never clamps out-of-range values.
+- **Schedule engine** — minute-boundary detection (250 ms heartbeat, jitter-proof); every minute the registered callbacks are evaluated once.
+- **Self-healing restart (double insurance)** — before EXIT the plugin always detaches a **self-healing helper** and then exits the old process:
+  1. wait up to 60 s for the port to free;
+  2. if a **healthy dsh** already owns the port (e.g. systemd relaunched it) → yield; if only a non-dsh process holds it → keep trying;
+  3. otherwise relaunch with the original argv + **health probe** (30 s) and **up to 3 retries**, logging every attempt;
+  4. supervisor mode (systemd `Restart=on-failure` / container) still works: the helper yields when the supervisor wins.
+- **Simulate-only drill mode** — `simulateOnly: true` in config or `DSH_RESTART_SIMULATE=1` in the env: finalize emits `restart-simulated` and runs the restore flow **in the same process without exiting**. `/status` exposes `simulate: true`.
+- **0.2.0-native integrations** — event-driven restore via `agent/created` (with `SessionStartSource`) instead of blind waiting; `app-boot/config-reload` is observed and surfaced as `lastConfigReloadAt`; legacy v0.1.x flat config keys are translated automatically.
+- **WebUI settings page** — “DSH 重启” card (permissions / PRE / POST / schedules / callbacks / log) with optimistic updates, plus a bottom-right overlay popup for pending restarts (non-blocking; default prefix `【DSH 重启】`).
 
-## Restart policies
+---
 
-| Policy | Behavior |
-|---|---|
-| `now` | Restart immediately after the configured exit delay. **Page/`/restart` only — AI cannot use it.** |
-| `wait-idle` | Polls all root sessions and restarts once every turn is finished/blocked; cancels on timeout (default 10 min, min 3 min). AI: even if already idle, waits at least 3 min. |
-| `notify` | Injects a notice prompt into all active sessions (“DSH 将在约 N 分钟后重启…”, `{minutes}` placeholder, editable), then restarts after `notifyWaitMs` (default 5 min, min 3 min); restarts early if everything becomes idle (AI: still at least 3 min). |
+## Prerequisites
 
-All waiting policies expose live progress and a **cancel** action.
+The plugin runs **inside dsh** (it is a Cordis host plugin), so start from a working dsh install — **do not** install Node yourself:
 
-## How the restart happens (environment-adaptive, zero external commands)
+- A running **dsh ≥ 0.1.5** (0.2.x recommended; this plugin is tested on 0.2.0-rc.2). dsh already bundles the Node runtime, and the dsh web UI is reachable at its configured port (default `3080`).
+- A **profile** for that instance whose `node_modules` and composition patch (`cordis.patch.yml`) you can write to — typically `$DSH_HOME/profiles/<name>/`.
+- No **other process squats the dsh web port** (a second instance would make the restart helper yield instead of relaunching).
+- **Bare runs (no supervisor)** need an external keeper for crash recovery: only *requested* restarts self-heal via the detached helper; an unexpected kill before the helper is armed has no relauncher. Prefer `systemd` with `Restart=on-failure` or a container that restarts the process (the plugin then exits with code 125 to trigger it).
 
-| Run shape | Detection | Restart path |
-|---|---|---|
-| systemd unit | `INVOCATION_ID` **and** own cgroup under `/system.slice/` | Write resume marker → exit `125` → systemd `Restart=on-failure` relaunches the same ExecStart |
-| container with a restart policy | `/proc/1` cgroup/comm | Same: non-zero exit, orchestrator relaunches |
-| bare run (terminal, npx, no supervisor) | no supervisor markers | A detached helper re-spawns the new instance with the same argv after the old process exits and frees the port (Windows: hidden console) |
+---
 
-No sudo, no bash scripting, no external watchdog. «Boot failure» falls back to the supervisor's own restart policy (systemd: 5 attempts / 10 s).
+## Install
 
-## Credential-rotation recovery (the easy part to get wrong)
+### Option A — from npm (after publication)
 
-dsh rotates the launch token every boot, so the old page can never recover by itself. The plugin uses core's two official interfaces: `ctx.connection.requestRejection()` (Host/Origin fence + browser auth for another web route) and `ctx.connection.authenticatedUrl()` (fresh token URL). The client polls the **public, local-only** probe route, and on identity change navigates to the new URL — the server mints a fresh cookie and 303s to clean `/`.
-
-## Security boundaries
-
-- **Core 403 is never downgraded**; only a **401 (rotated cookie)** is allowed to fall back to *local/private-IP literal + same-origin* (DNS rebinding via domain authorities is rejected).
-- **Mutation routes** (restart / config / cancel / open-log) require full core auth (`requestRejection` must pass); loopback + same-origin when the connection service is unavailable.
-- The probe/log routes are readable without credentials **by design** (required for recovery) but only from loopback/private-IP authorities.
-- `POST /config` is strictly validated key-by-key; out-of-range values are **rejected with an error, never silently clamped** (`restartDelayMs 0–60000ms`; `waitIdleTimeoutMs` / `notifyWaitMs` `180000–86400000ms`; booleans strict; text non-empty ≤ 2000 chars).
-- AI restarts: two-step challenge (16-char, one-time, 5 min TTL) **bound to the exact first-call `policy`**, plus the hard 3-minute countdown and a user-visible popup.
-
-## Limitations (read before using)
-
-1. **AI cannot restart immediately** (`now` is page-only) — by design, to protect sessions.
-2. The **systemd automatic-recovery path requires the supervisor's `Restart=on-failure`** (or a container restart policy). If your deployment has *no* supervisor with a restart policy (bare `dsh web` in a terminal), the plugin **does not provide crash daemons**: it restarts on request (helper respawn), but a crash has no one to relaunch it — run it under a supervisor or inside a restart loop.
-3. A page is auto-reopened only while a page is open at restart time (the watcher runs in the browser). No page open → nobody navigates; open the URL fresh.
-4. Restarting **interrupts all sessions and connections**; an in-flight assistant stream may lose its last tokens (turn is marked `interrupted`) — history is never corrupted.
-5. Sessions that were merely *queued* (not yet durable) lose that queue on any restart — this is core dsh behavior, not something the plugin changes.
-6. The resume marker covers **root sessions with an in-flight turn or an active goal**; everything else is left alone (the UI reopens them as usual).
-7. The probe/log routes intentionally refuse **domain-based** access (LAN IP literals and loopback only) — remote-tunneled setups cannot use auto-recovery/log-open (manual URL from the log instead).
-8. **Web platform only** (TUI/desktop are out of scope); single-harness assumption — two instances sharing one `$DSH_HOME` would share the resume marker/log.
-9. The challenge is in-memory: a plugin reload (HMR of composition files) or a manual restart resets it — re-issue by calling the tool again.
-10. No destructive operations (e.g. “clear sessions then restart”) are provided — deliberately.
-
-## Dependencies
-
-- **Runtime**: Node >= 20; dsh >= 0.1.5-rc.1 (verified baseline) running the **web** profile (`dsh web`).
-- **Imported packages** (all **optional peerDependencies**, resolved against the DSH runtime's single copy — never a second copy, see [#1337](https://github.com/deepseek-ai/deepseek-harness/discussions/1337)): `@deepseek-ai/dsh-tools` (`defineTool`), `@deepseek-ai/dsh-llm` (`createUserMessage`), `@deepseek-ai/schemastery` (config schema).
-- **Services consumed via `ctx` when present** (each degrades gracefully if missing): `tools`, `agents`, `webServer`, `commands`, `settings`, `sessionController`, `goals`, `connection`.
-- **Runtime files** written under `$DSH_HOME`: `dsh-resume.json` (resume marker), `dsh-harness-restart.log` (events + debug).
-- **No sudo / no bash scripts / no watchdog / no npm runtime dependencies.**
-
-## Installation
-
-### One-liner (recommended, after the package is published)
-
-```sh
-# from GitHub
-dsh plugin --profile web add github:<owner>/dsh-harness-restart
-
-# or from npm (once published)
-dsh plugin --profile web add dsh-harness-restart
+```bash
+cd "$DSH_HOME/profiles/<your-profile>"     # e.g. ~/.dsh/profiles/web
+pnpm add dsh-harness-restart               # or: npm install dsh-harness-restart
 ```
 
-Then **restart DSH once** to activate (the plugin manages subsequent restarts itself).
+### Option B — offline / from a tarball
 
-### For AI agents (hand this checklist to your agent)
+```bash
+cd "$DSH_HOME/profiles/<your-profile>"
+pnpm add ./dsh-harness-restart-0.1.0.tgz
+# or place the package directory directly:
+#   node_modules/dsh-harness-restart/
+```
 
-1. Run: `dsh plugin --profile web add github:<owner>/dsh-harness-restart` (or the npm variant).
-2. If the network blocks pnpm fetches, fall back to editing `profiles/<profile>/package.json` manually: add `"dsh-harness-restart": "file:/path/to/dsh-harness-restart"` to `dependencies` and `"dsh-harness-restart"` to `dsh.profile.bundles`, then run `pnpm install` in the profile directory.
-3. Verify the bundle resolved: `dsh --profile web --dump-config | grep -c harness-restart` should be ≥ 1.
-4. Restart DSH once (e.g. `sudo systemctl restart dsh-web.service` or restart the terminal `dsh web`).
-5. Verify: open Settings → **“DSH 重启”**. The AI may then call `dsh_restart` with `policy: wait-idle|notify`, follow the returned challenge token, and the popup shows “发起方：AI（模型工具）” with the countdown.
+### Enable the plugin row
 
-### Manual install
+Insert a row into the profile composition patch (`profiles/<name>/cordis.patch.yml`):
 
-1. Make sure `dsh` is installed (`npm i -g @deepseek-ai/dsh`, Node >= 20).
-2. Decide the source: GitHub tag / npm package / local checkout (see One-liner).
-3. Add the dependency and bundle entry in `profiles/<profile>/package.json` (the `file:` form is shown in the AI section; for npm/GitHub `dsh plugin … add` does this for you).
-4. `cd ~/.dsh/profiles/<profile> && pnpm install` (or run via `dsh plugin`).
-5. Restart DSH once.
+```yaml
+- insert:
+    - id: harness-restart
+      name: 'dsh-harness-restart'
+      config: {}          # defaults; see the configuration table below
+```
 
-## Compatibility
+Then **restart dsh**, and open Settings → **“DSH 重启”**. Verify the file landed with:
 
-- Verified against `dsh 0.1.5-rc.1`; declared as `dsh.engines.dsh >= 0.1.5-rc.1`. API drift is possible in 0.1.x — see the compatibility matrix in CHANGELOG before upgrading dsh.
-- Tests: `npm test` (unit, 85 assertions) and `npm run test:profile` (isolated real-install smoke) — both offline-safe, no live instance touched.
+```bash
+dsh --profile <your-profile> --dump-config | grep -A3 harness-restart
+```
 
-## Credits
+Peer requirements (all satisfied by dsh ≥ 0.1.5 / 0.2.0, no extra install needed):
 
-- Restart mechanism, identity probe and auto-continue follow the patterns of [anweat/dsh-restart](https://github.com/anweat/dsh-restart) (MIT); the detached relaunch helper is an adaptation of its `relaunch-helper` (attribution is also embedded in `lib/core.js`; the full upstream MIT text lives in the dev repository's `NOTICE`).
-- Settings-page placement idea inspired by [1123762794/dsh-web-restart](https://github.com/1123762794/dsh-web-restart).
+```
+@deepseek-ai/cordis    ^4.0.2
+@deepseek-ai/dsh-tools >=0.0.1-rc.1
+@deepseek-ai/dsh-llm   >=0.0.1-rc.1
+@deepseek-ai/schemastery ^3.18.0
+react                  ^18.2.0
+```
+
+---
+
+## Configuration
+
+All keys are optional. Priority: **runtime overrides file** (`$DSH_HOME/dsh-harness-restart-v1.json`) > **patch config** (`cordis.patch.yml` row) > **defaults**. Out-of-range values are **rejected with an error** (never clamped); a corrupted overrides file falls back with visible `warnings` and never bricks startup.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `ai.restartEnabled` | `true` | Allow the AI to trigger restarts |
+| `ai.challengeEnabled` | `true` | Two-step challenge for AI restarts |
+| `ai.allowNow` | `false` | Allow AI to use `now` |
+| `ai.delayRangeMs` | `[180000, 3600000]` | AI `delay` window (3 min–1 h); out-of-range → error + recommended value (`ai.recommendDelayMs`, 5 min) |
+| `trigger.defaultTrigger` / `defaultDelayMs` | `delay` / `300000` | What a schedule hit fires with |
+| `schedule` | `[]` | `{id, kind: preset|script, preset?, args?, script?, enabled?}` — presets `now/delay/daily/weekly/immediate/waitSeconds/waitAllOrForce`; scripts run as full-trust code (strong warning + audit sha256) |
+| `preRestart` | `{mode:'waitAllOrForce', forceAfterMs:30000}` | `immediate` / `waitSeconds(N)` / `waitAllOrForce(-1 = forever)` |
+| `postRestart` | `{mode:'resumeAll'}` | `none` / `resumeRequester` / `resumeAll` |
+| `restartDelayMs` | `2000` | Grace before the old process exits (ms) |
+| `challengeTtlMs` | `300000` | Challenge token lifetime |
+| `bootRestoreDelayMs` | `60000` | First wait before progressive restore |
+| `restoreStaggerMs` | `5000` | One callback session every N ms afterwards |
+| `callbackUnackTimeoutMs` | `1800000` | Receipt timeout (30 min) → one reminder |
+| `simulateOnly` | `false` | Drill mode: no real restart (or env `DSH_RESTART_SIMULATE=1`) |
+| `notifyPrompt` / `continuePrompt` / `restorePrompt` | `【DSH 重启】…` | Prompts; `{minutes}` / `{cbId}` / `{description}` placeholders |
+| `logTailLines` | `300` | Log viewer tail size |
+
+Legacy v0.1.x flat keys (`aiRestartEnabled`, `restartPolicy`, `notifyWaitMs`, …) are accepted and translated automatically.
+
+---
+
+## HTTP API
+
+All routes live under `/plugins/dsh-harness-restart`, guarded to **localhost / private subnets + same-origin**.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/status` | pid, mode, config, pending, callbacks, supervisors, `simulate`, `lastConfigReloadAt` |
+| GET | `/config` | effective config + warnings |
+| POST | `/config` | write config (`{patch: {...}}`); strict validation |
+| POST | `/restart` | `{trigger:'now'|'delay', delayMs?}` → 202 waiting / 200 accepted / 409 single-flight |
+| POST | `/cancel` | cancel a waiting restart |
+| GET | `/check` | read-only preflight |
+| GET | `/log` | tail of the event log |
+| GET | `/log/open` | path of the event log |
+
+Event log: `$DSH_HOME/dsh-harness-restart.log` — records `restart-waiting`, `restart-about-to-exit`, `restart-finalized`, `restart-simulated`, `restart-resumed`, `restore-step`, `callback-error`, `schedule-trigger`, `ai-restart-denied`, … one JSON per line.
+
+---
+
+## Limitations (boundaries)
+
+- **Scope is the dsh process only.** The plugin restarts the dsh web process it runs in; it never restarts, touches, or manages any other system process or service.
+- **Crash without a supervisor does not self-heal.** In bare runs the detached helper is only armed during a *requested* restart (`/restart`, tools, schedule). If dsh is killed out of the blue (OOM, `kill -9`, power loss) before the helper exists, nothing relaunches it — run under systemd/container for crash resilience.
+- **Post-restart continuation depends on dsh’s own session persistence.** The plugin injects “continue” prompts (resume targets + registered callbacks); the underlying conversation history survives because dsh persists session logs. Sessions that cannot be revived (no live agent, no `sessionController`) are skipped and logged.
+- **Only registered/unfinished sessions are resumed.** `resumeAll` covers unfinished root sessions plus sub-agents (via `agents.list()`); other archived/closed sessions are not touched.
+- **One pending restart at a time (single-flight).** A concurrent second request returns `409` until the first is cancelled or finalized.
+- **AI restrictions are intentional.** AI cannot use `now` by default, `delay` must be within `ai.delayRangeMs`, and each AI restart needs the two-step challenge.
+- **Public/tunneled deployments lose probe routes.** Domain authorities are always rejected (`403`); the page auto-reopen and log-open fall back to the printed token URL.
+- **Drill mode does not produce a real restart.** `simulateOnly` runs the full event chain and restore flow in-process; nothing exits, and `/status` never shows a new pid.
+- **Helper logs live in `/tmp`** (`/tmp/dsh-harness-restart-<stamp>-<port>.{out,err}.log`) and may be cleaned by the OS across reboots; the definitive event trail is `$DSH_HOME/dsh-harness-restart.log`.
+
+---
+
+## Security
+
+See [`SECURITY.md`](SECURITY.md) for the full threat model. Highlights:
+
+- **Route guard**: all mutation and read routes accept only loopback / private IP literals as `Host`, and require same-origin when an `Origin` is present; **domain authorities (incl. DNS-rebinding candidates) are always `403`**, never downgraded.
+- **AI tools**: two-step challenge (16-hex token, one-time, 5 min TTL) bound to the first-call arguments; `now` off for AI; out-of-range `delay` rejected with the recommended value.
+- **Config writes**: per-key strict validation (`validateConfigV1`); out-of-range values are rejected, never clamped; only the plugin’s own config namespace can be written.
+- **Script callbacks run with full trust** in the host process (`new Function`); they are never fetched remotely, are gated behind a strong warning at registration, carry an audit sha256 in the event log, and are individually disablable (`enabled: false`).
+- **Data written**: `$DSH_HOME/dsh-resume.json` (session ids, requester, registered callbacks, timestamp) and `$DSH_HOME/dsh-harness-restart.log` (events; may contain session ids and local paths) — both local to the harness user.
+
+---
+
+## Testing (safe, does not touch a running dsh)
+
+The plugin restarts its own process — testing directly on a live instance is what we designed away.
+
+```bash
+npm run test          # pure logic + client contract (72 + 11 + 11 assertions, ms)
+npm run test:simulate # isolated instance, drill mode: full event chain, zero process deaths (11 checks)
+npm run test:e2e      # isolated instance incl. a REAL restart loop (10 checks)
+npm run test:chaos    # 9 fault-injection scenarios (kill -9, port squatted by non-dsh,
+                      # concurrent 409, helper file deleted, corrupt marker, corrupt config, drills…)
+```
+
+Every isolated scenario uses a throwaway `DSH_HOME` under `/tmp`, a dedicated port, and a `trap` that always cleans up. Real-restart loops happen only against those **dummy instances**, never against the dsh you are using.
+
+---
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT — see [`LICENSE`](LICENSE).
+
+## Security
+
+See [`SECURITY.md`](SECURITY.md).

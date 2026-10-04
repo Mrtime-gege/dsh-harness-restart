@@ -1,7 +1,7 @@
 {
   "name": "dsh-harness-restart",
   "version": "0.1.0",
-  "description": "Restart DeepSeek Harness from a settings page: restart button, restart policies (now / wait-idle / notify), AI permission switches with two-step challenge authentication, dsh_restart + dsh_restart_cancel tools, /restart command, in-settings log viewer with one-click open, environment-adaptive restart (supervisor self-exit vs detached respawn), post-restart auto-continue and credential-rotation self-healing.",
+  "description": "重启 DeepSeek Harness 进程并自动继续未完成工作：四层重启引擎（触发→审批→PRE 等待→EXIT→POST 恢复）、AI 二次认证、定时/每日/脚本回调、重启后按方案 B 渐进恢复已注册回调的会话（等 1 分钟、每 5 秒一个、回执超时提醒）、演练模式（simulateOnly 不真重启）、自愈双保险（supervisor 让位 + detached helper 健康探测重试）。Restart the DeepSeek Harness process and resume unfinished work: four-layer restart engine (trigger→approval→PRE wait→EXIT→POST restore), two-step AI authentication, daily/script callback scheduling, receipt-based progressive restore (1 min wait + one session per 5 s + unack reminder), simulate-only drill mode, and self-healing restart (supervisor yield + detached helper with health-check retries).",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -17,7 +17,10 @@
     "lib",
     "cordis.patch.yml",
     "README.md",
-    "LICENSE"
+    "README.zh.md",
+    "SECURITY.md",
+    "LICENSE",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=20"
@@ -72,10 +75,14 @@
   ],
   "license": "MIT",
   "scripts": {
-    "check": "node --check lib/index.js && node --check lib/client.js && node --check lib/core.js",
-    "test": "node tests/unit.mjs",
+    "check": "node --check lib/index.js && node --check lib/client.js && node --check lib/core.js && node --check lib/config.js && node --check lib/callbacks.js",
+    "test": "node tests/unit.mjs && node tests/client-mock.mjs && node tests/v1-pre-schedule.mjs",
     "test:profile": "bash scripts/test-in-profile.sh",
-    "prepublishOnly": "npm run check && npm test"
+    "prepublishOnly": "npm run check && npm run release:check",
+    "release:check": "node scripts/release-check.mjs",
+    "test:e2e": "bash scripts/test-e2e.sh",
+    "test:simulate": "bash scripts/test-e2e.sh --simulate",
+    "test:chaos": "bash scripts/chaos-matrix.sh"
   },
   "publishConfig": {
     "access": "public"
