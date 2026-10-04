@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Syntax check
+        run: |
+          node --check lib/index.js
+          node --check lib/client.js
+          node --check lib/core.js
+      - name: Release invariants (version / CHANGELOG / files whitelist / leak scan)
+        run: node scripts/release-check.mjs
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install the pinned DSH baseline (contains the runtime @deepseek-ai/* packages)
+        run: npm i -g @deepseek-ai/dsh@0.1.5-rc.1
+      - name: Isolated profile test (unit + boot smoke, no live instance touched)
+        run: bash scripts/test-in-profile.sh

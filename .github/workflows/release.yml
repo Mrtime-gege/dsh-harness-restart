@@ -1,0 +1,263 @@
+# 发布：推 `v*` tag → 校验版本一致 → 发布到 npm → 用 CHANGELOG 段落创建 GitHub Release。
+#
+# 触发前提（三者必须一致）：
+#   * `package.json` 的 `version`      —— 例如 0.1.0
+#   * `CHANGELOG.md` 里 `## 0.1.0 …` 的段落（`npm run release:check` 会校验）
+#   * 推上去的 tag                     —— 例如 v0.1.0（本流程会校验去掉 `v` 后等于版本号）
+#
+# ── 两条发布路线，本文件同时支持，走哪条都不需要改动它 ──────────────────────────────
+#
+# 路线 A（仓库里配置了 `NPM_TOKEN` secret）：用长期 token 发布。
+#   建议用 npm 的 **Granular Access Token**，权限 `Read and write`、Packages 只限本包、
+#   有效期尽量短。长期 token 存在仓库里始终是风险点：一旦泄漏，或被 Actions 日志／
+#   第三方 action 读走，任何人都能以你的名义发布。
+#
+# 路线 B（**没有** `NPM_TOKEN`）：自动改走 npm 的 **Trusted Publisher（OIDC）**。
+#   在 npm 包页面 → Settings → Trusted Publisher 登记本仓库与 workflow 文件名 `release.yml`
+#   （本文件已声明 `id-token: write`），然后把仓库里的 `NPM_TOKEN` secret **删掉**即可 ——
+#   不需要改本文件。npm 会用 GitHub 的 OIDC 身份换取一次性短期凭据，仓库里不再留下任何
+#   可复用的发布密钥。注意 OIDC 需要 npm >= 11.5.1，所以下面有一步显式升级 npm。
+#
+# 详见 PUBLISHING.md 的 4.1 / 4.4。
+# ─────────────────────────────────────────────────────────────────────────────────
+#
+# 注意：`npm publish` 一旦成功，同一个版本号无法重发（npm 不允许覆盖已发布版本）。
+# 因此本流程把校验放在发布之前，并且**发布前会查一次 registry**：
+#   * 该版本还没发布 → 正常发布；
+#   * 该版本已经在 npm 上（例如本地已经手工 publish 过，或者这次是重跑）→ **跳过发布**，
+#     只补建 GitHub Release，不会因为 E403 把整条流水线弄红。
+# 也就是说这个 workflow 是幂等的，可以安全地对着同一个 tag 重跑。
+name: Release（npm 自动发布：token 或 OIDC 双路线）
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # 手动入口：用于「撤销已发布版本」这类注册表写入。
+  #
+  # 为什么放在这个文件里而不是新开一个 workflow：npm 的 Trusted Publisher 登记的是
+  # **workflow 文件名**，OIDC 声明里也带这个名字 —— 换个文件名的 workflow 换来的身份会被 npm 拒掉。
+  # 手动运行**不会发布任何东西**：发布 job 只在 push tag 时执行（见 jobs.publish 的 if）。
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: '要撤销的版本号（逗号分隔，例如 0.1.0,0.1.1,0.1.2）'
+        required: true
+        type: string
+      confirm:
+        description: '输入包名以确认撤销（dsh-harness-restart）'
+        required: true
+        type: string
+
+permissions:
+  contents: write # 创建 GitHub Release
+  id-token: write # npm provenance 与 Trusted Publisher（OIDC）
+
+jobs:
+  publish:
+    name: 发布到 npm 并建 Release
+    # 只有推 tag 才发布；手动 dispatch 进来时跳过（它是给 unpublish job 用的）
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出（含全部历史与 tag）
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: 配置 Node 与 npm registry
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: 确保 npm 版本满足发布要求
+        run: |
+          # provenance 自 npm 9.5 起可用；Trusted Publisher（OIDC）需要 npm >= 11.5.1。
+          # Node 20 自带的 npm 是 10.x，所以这里显式升到 11。
+          npm install -g 'npm@^11'
+          npm -v
+
+      - name: 校验 tag 与 package.json 版本一致
+        id: version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(node -p "require('./package.json').version")"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 package.json 的版本 ${pkg_version} 不一致；请改回一致后重新打 tag。"
+            exit 1
+          fi
+          echo "版本校验通过：${GITHUB_REF_NAME} == ${pkg_version}"
+          echo "version=${pkg_version}" >> "$GITHUB_OUTPUT"
+
+      - name: 语法检查
+        run: npm run check
+
+      - name: 发布不变量检查
+        run: npm run release:check
+
+      - name: 该版本是否已经在 npm 上
+        id: exists
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          # 幂等保护：同一个 tag 重跑、或本地已经 `npm publish` 过再推 tag 时，
+          # 直接发布必然 E403「cannot publish over existing version」，而 npm 不允许覆盖已发布版本。
+          # 所以先查一次；已有就跳过发布，只补建 Release。
+          if npm view "dsh-harness-restart@${version}" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::npm 上已有 dsh-harness-restart@${version}，跳过发布，只创建 GitHub Release。"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "npm 上尚无 dsh-harness-restart@${version}，本次将执行发布。"
+          fi
+
+      - name: 选择发布凭据（配了 NPM_TOKEN 用 token，没配则用 OIDC）
+        id: creds
+        if: steps.exists.outputs.published == 'false'
+        env:
+          # 只在这一步把 secret 放进环境，避免其它步骤（含第三方 action）拿到它。
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "${NPM_TOKEN}" ]; then
+            echo "mode=token" >> "$GITHUB_OUTPUT"
+            echo "使用仓库 secret NPM_TOKEN 发布。"
+          else
+            echo "mode=oidc" >> "$GITHUB_OUTPUT"
+            echo "未配置 NPM_TOKEN，改走 Trusted Publisher（OIDC）发布。"
+          fi
+
+      - name: 发布到 npm（用仓库 secret NPM_TOKEN）
+        if: steps.exists.outputs.published == 'false' && steps.creds.outputs.mode == 'token'
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: 发布到 npm（用 npm Trusted Publisher / OIDC）
+        if: steps.exists.outputs.published == 'false' && steps.creds.outputs.mode == 'oidc'
+        env:
+          # setup-node 生成的用户级 .npmrc 里有一行 `_authToken=${NODE_AUTH_TOKEN}`。
+          # 走 OIDC 时必须让 npm 完全依赖 GitHub 的 OIDC 身份，因此换一份干净的 userconfig，
+          # 只留 registry，不出现任何 token 行。
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npmrc-oidc
+        run: |
+          printf 'registry=https://registry.npmjs.org/\n' > "${NPM_CONFIG_USERCONFIG}"
+          npm publish --provenance --access public
+
+      - name: 从 CHANGELOG 抽取本版段落
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          # 与 scripts/release-check.mjs 的判定保持一致：以 "## " 开头且包含版本号的行为段落起点。
+          start="$(grep -n '^## ' docs/CHANGELOG.md | grep -F "${VERSION}" | head -1 | cut -d: -f1)"
+          if [ -z "${start}" ]; then
+            echo "::error::docs/CHANGELOG.md 里找不到 ${VERSION} 的段落（应以 \"## ${VERSION}\" 开头）"
+            exit 1
+          fi
+          # 下一段标题（若有）就是本段落的结束位置；行号相对 tail 的起点，故换算成相对行数。
+          next="$(tail -n "+$((start + 1))" docs/CHANGELOG.md | grep -n '^## ' | head -1 | cut -d: -f1)"
+          if [ -n "${next}" ]; then
+            tail -n "+$((start + 1))" docs/CHANGELOG.md | head -n "$((next - 1))" > /tmp/release-notes.md
+          else
+            tail -n "+$((start + 1))" docs/CHANGELOG.md > /tmp/release-notes.md
+          fi
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "本次发布详见 CHANGELOG.md。" > /tmp/release-notes.md
+          fi
+          echo "── Release 说明预览 ──"
+          cat /tmp/release-notes.md
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "::error::Release ${GITHUB_REF_NAME} 已存在。请勿重发版本；直接编辑既有 Release 的说明即可。"
+            exit 1
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file /tmp/release-notes.md
+
+  # ── 手动撤销：用同一个受信发布者身份换短期 token，再调 npm 撤销指定版本 ────────────────
+  #
+  # 为什么放在 CI 而不是本机：账号的 2FA 第二因子若是**通行密钥（WebAuthn）**，
+  # CLI 的 `--otp` 要的是 6 位动态码（TOTP），本机根本拿不到 —— 注册表只会一直回
+  # `www-authenticate: OTP`。这条路的身份来自 GitHub OIDC，不需要任何交互式 2FA。
+  #
+  # 换取流程照搬 npm 自己的 lib/utils/oidc.js：
+  #   1) GET  $ACTIONS_ID_TOKEN_REQUEST_URL&audience=npm:registry.npmjs.org  → GitHub id_token
+  #   2) POST /-/npm/v1/oidc/token/exchange/package/<包名>（Bearer id_token） → 短期 npm token
+  #
+  # 边界：npm 只把受信发布者用于「发布」，这个 token 能不能做**写入**由注册表说了算 ——
+  # 若被拒，日志里是 401/403，不会留下半成品状态（unpublish 的第一步就会失败）。
+  unpublish:
+    name: 撤销已发布版本
+    if: github.event_name == 'workflow_dispatch' && inputs.confirm == 'dsh-harness-restart'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: 检出
+        uses: actions/checkout@v5
+
+      - name: 配置 Node 与 npm registry
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: 确保 npm 版本满足 OIDC 要求
+        run: |
+          npm install -g 'npm@^11'
+          npm -v
+
+      - name: 用 GitHub OIDC 换 npm 短期 token
+        id: oidc
+        run: |
+          set -euo pipefail
+          json_field() { node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s)[process.argv[1]]||"")}catch{process.stdout.write("")}})' "$1"; }
+
+          echo "── 1/2 取 GitHub id_token（audience=npm:registry.npmjs.org）"
+          id_token="$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org" | json_field value)"
+          if [ -z "${id_token}" ]; then
+            echo "::error::拿不到 GitHub OIDC id_token（检查本 job 的 id-token: write 权限）"
+            exit 1
+          fi
+
+          echo "── 2/2 用 id_token 换 npm token"
+          response="$(curl -sS -X POST -H "Authorization: Bearer ${id_token}" \
+            "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/dsh-harness-restart")"
+          token="$(printf '%s' "${response}" | json_field token)"
+          if [ -z "${token}" ]; then
+            echo "::error::换 token 失败，注册表回应：$(printf '%s' "${response}" | head -c 300)"
+            exit 1
+          fi
+          echo "::add-mask::${token}"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+          echo "✓ 已拿到短期 token（已加入日志掩码）"
+
+      - name: 撤销指定版本
+        env:
+          NODE_AUTH_TOKEN: ${{ steps.oidc.outputs.token }}
+          VERSIONS: ${{ inputs.versions }}
+        run: |
+          set -uo pipefail
+          failed=0
+          for v in $(printf '%s' "${VERSIONS}" | tr ',' ' '); do
+            [ -z "${v}" ] && continue
+            echo "── 撤销 dsh-harness-restart@${v}"
+            if npm unpublish "dsh-harness-restart@${v}"; then
+              echo "  ✓ 已撤销 ${v}"
+            else
+              echo "  ✗ ${v} 撤销失败（EOTP/E401 表示该 token 不被允许做写入）"
+              failed=1
+            fi
+          done
+          echo "── 注册表当前状态"
+          curl -sS -H 'accept: application/json' https://registry.npmjs.org/dsh-harness-restart \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);console.log("  版本:",Object.keys(j.versions||{}).join(", "));console.log("  dist-tags:",JSON.stringify(j["dist-tags"]))})'
+          exit "${failed}"
