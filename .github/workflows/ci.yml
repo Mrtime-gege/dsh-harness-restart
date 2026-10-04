@@ -42,7 +42,8 @@ jobs:
           node -v
           npm run check
 
-      - name: 纯逻辑测试（不依赖 dsh 进程）
+      - name: 纯逻辑测试（仅开发分支；release 分支无 tests/ 目录）
+        if: github.ref != 'refs/heads/release'
         run: npm test
 
       - name: 发布不变量检查
