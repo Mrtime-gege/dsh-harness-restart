@@ -75,7 +75,7 @@
   "license": "MIT",
   "scripts": {
     "check": "node --check lib/index.js && node --check lib/client.js && node --check lib/core.js && node --check lib/config.js && node --check lib/callbacks.js",
-    "test": "node tests/unit.mjs && node tests/client-mock.mjs && node tests/v1-pre-schedule.mjs",
+    "test": "node tests/unit.mjs && node tests/client-mock.mjs && node tests/v1-pre-schedule.mjs && node tests/approval-v2.mjs",
     "test:profile": "bash scripts/test-in-profile.sh",
     "prepublishOnly": "npm run check && npm run release:check",
     "release:check": "node scripts/release-check.mjs",
