@@ -1,79 +1,79 @@
 # dsh-harness-restart
 
-A host plugin that **restarts the DeepSeek Harness (dsh) process and automatically continues unfinished work** — with an approval gate for AI-initiated restarts, schedule/script callbacks, a receipt-based progressive restore of registered callbacks (scheme B), a simulate-only drill mode, and a self-healing restart path that works both under a supervisor and in bare runs.
+**重启整个 DeepSeek Harness（dsh）进程并自动继续未完成工作**的宿主插件：AI 发起重启需审批门禁、支持定时/脚本回调、重启后按**方案 B（回执式）渐进恢复**已注册回调的会话、内置**演练模式**（不真重启）、以及一套 supervisor 与裸跑都能用的**自愈双保险重启路径**。
 
-Built and verified against **dsh 0.2.0** (tested on 0.2.0-rc.2; legacy v0.1.x config keys are mapped automatically).
-
----
-
-## Features
-
-- **Four-layer restart engine** — TRIGGER → APPROVAL → PRE → EXIT → POST:
-  1. **Trigger**: manual button/HTTP, AI tool, or schedule callbacks (official presets `now` / `delay` / `daily` / `weekly` / `immediate` / `waitSeconds` / `waitAllOrForce`, plus user **JavaScript callbacks** with full-trust warning + audit).
-  2. **Approval**: AI-initiated restarts require a two-step challenge (16-hex token must be echoed); AI is restricted to `delay` inside `ai.delayRangeMs` (default 3 min–1 h), `now` is off by default.
-  3. **PRE**: decide when to actually leave — `immediate`, `waitSeconds(N)`, or `waitAllOrForce` (idle-wait with force timeout; `-1` = wait forever). Sub-agents (subagent children, Agent Teams teammates) are part of the idle snapshot via `agents.list()`.
-  4. **EXIT → POST**: write the resume marker, then restart; after boot, restore unfinished sessions and progressive callback sessions.
-- **Receipt-based restore (scheme B)** — `dsh_restart_register_callback` lets any session register a “continue this task after restart” callback; after boot the plugin waits `bootRestoreDelayMs` (1 min), then wakes **one callback session every `restoreStaggerMs`** (5 s). Each restored session must ack via `dsh_restart_callback_done`; unacked callbacks get one reminder after `callbackUnackTimeoutMs` (30 min), then `callback-unacked`.
-- **AI tools** — `dsh_restart`, `dsh_restart_cancel`, `dsh_restart_register_callback`, `dsh_restart_callback_done`. Strict validation, never clamps out-of-range values.
-- **Schedule engine** — minute-boundary detection (250 ms heartbeat, jitter-proof); every minute the registered callbacks are evaluated once.
-- **Self-healing restart (double insurance)** — before EXIT the plugin always detaches a **self-healing helper** and then exits the old process:
-  1. wait up to 60 s for the port to free;
-  2. if a **healthy dsh** already owns the port (e.g. systemd relaunched it) → yield; if only a non-dsh process holds it → keep trying;
-  3. otherwise relaunch with the original argv + **health probe** (30 s) and **up to 3 retries**, logging every attempt;
-  4. supervisor mode (systemd `Restart=on-failure` / container) still works: the helper yields when the supervisor wins.
-- **Simulate-only drill mode** — `simulateOnly: true` in config or `DSH_RESTART_SIMULATE=1` in the env: finalize emits `restart-simulated` and runs the restore flow **in the same process without exiting**. `/status` exposes `simulate: true`.
-- **0.2.0-native integrations** — event-driven restore via `agent/created` (with `SessionStartSource`) instead of blind waiting; `app-boot/config-reload` is observed and surfaced as `lastConfigReloadAt`; legacy v0.1.x flat config keys are translated automatically.
-- **WebUI settings page** — “DSH 重启” card (permissions / PRE / POST / schedules / callbacks / log) with optimistic updates, plus a bottom-right overlay popup for pending restarts (non-blocking; default prefix `【DSH 重启】`).
+基于 **dsh 0.2.0** 构建并验证（在 0.2.0-rc.2 上全量测试；旧 v0.1.x 平铺配置键自动兼容映射）。
 
 ---
 
-## Prerequisites
+## 特性
 
-The plugin runs **inside dsh** (it is a Cordis host plugin), so start from a working dsh install — **do not** install Node yourself:
-
-- A running **dsh ≥ 0.1.5** (0.2.x recommended; this plugin is tested on 0.2.0-rc.2). dsh already bundles the Node runtime, and the dsh web UI is reachable at its configured port (default `3080`).
-- A **profile** for that instance whose `node_modules` and composition patch (`cordis.patch.yml`) you can write to — typically `$DSH_HOME/profiles/<name>/`.
-- No **other process squats the dsh web port** (a second instance would make the restart helper yield instead of relaunching).
-- **Bare runs (no supervisor)** need an external keeper for crash recovery: only *requested* restarts self-heal via the detached helper; an unexpected kill before the helper is armed has no relauncher. Prefer `systemd` with `Restart=on-failure` or a container that restarts the process (the plugin then exits with code 125 to trigger it).
+- **四层重启引擎** —— TRIGGER → APPROVAL → PRE → EXIT → POST：
+  1. **触发**：页面按钮 / HTTP / AI 工具 / 定时回调（官方预设 `now` / `delay` / `daily` / `weekly` / `immediate` / `waitSeconds` / `waitAllOrForce`，以及用户**自定义 JavaScript 回调**——完全信任并带强告警与审计）。
+  2. **审批**：AI 发起的重启需两段式挑战（16 位 hex token 必须原样复述）；AI 只能用 `delay` 且落在 `ai.delayRangeMs`（默认 3 分钟~1 小时）内，`now` 默认关闭。
+  3. **PRE**：何时真正离开 —— `immediate` / `waitSeconds(N)` / `waitAllOrForce`（等空闲加超时强断，`-1` = 无限等）。空闲快照通过 `agents.list()` **涵盖子 agent**（subagent 子会话、Agent Teams teammate）。
+  4. **EXIT → POST**：写恢复标记 → 重启；重启后恢复未完成会话与渐进回调会话。
+- **方案 B：回执式恢复** —— `dsh_restart_register_callback` 让任何会话注册“重启后继续该任务”的回调；重启后先等 `bootRestoreDelayMs`（1 分钟），然后**每 `restoreStaggerMs`（5 秒）唤醒一个**回调会话。被恢复的会话须用 `dsh_restart_callback_done` 回执；超时 `callbackUnackTimeoutMs`（30 分钟）未回执先提醒一次，再记 `callback-unacked`。
+- **AI 工具** —— `dsh_restart` / `dsh_restart_cancel` / `dsh_restart_register_callback` / `dsh_restart_callback_done`。严格校验，越界**绝不静默钳制**。
+- **调度引擎** —— 250ms 心跳的**分钟边界检测**（抗事件循环抖动），每分钟对全部注册回调求值一次。
+- **自愈重启（双保险）** —— EXIT 前总是先挂一个 detached **自愈 helper**，再退出旧进程：
+  1. 最多等 60s 让端口释放；
+  2. 端口已被**健康的 dsh** 接管（如 systemd 已拉起新实例）→ 让位；若只是非 dsh 进程占着 → 继续尝试；
+  3. 否则用原 argv 重新拉起 + **健康探测**（30s）+ **最多 3 次重试**，逐步写入日志；
+  4. supervisor 模式（systemd `Restart=on-failure` / 容器）照常工作：supervisor 抢先时 helper 让位。
+- **演练模式** —— 配置 `simulateOnly: true` 或环境变量 `DSH_RESTART_SIMULATE=1`：finalize 记 `restart-simulated` 并**在同一进程内**跑完恢复流程、不退出。`/status` 暴露 `simulate: true`。
+- **0.2.0 原生接入** —— 通过 `agent/created` 事件（含 `SessionStartSource`）**事件驱动恢复**而非盲等 1 分钟；监听 `app-boot/config-reload` 并以 `lastConfigReloadAt` 呈现；旧版平铺键自动翻译。
+- **WebUI 设置页** —— 「DSH 重启」卡片（权限 / PRE / POST / 调度 / 回调 / 日志）乐观更新；右下角非阻塞小窗提示等待中的重启（默认前缀 `【DSH 重启】`）。
 
 ---
 
-## Install
+## 前置条件
 
-### Option A — from npm (after publication)
+插件**运行在 dsh 内部**（是 Cordis 宿主插件），所以以下都以"已装好 dsh"为起点——**无需自己安装 Node**：
+
+- 一个可用且已启动的 **dsh ≥ 0.1.5**（推荐 0.2.x；本插件已在 0.2.0-rc.2 全量测试）。dsh 自带 Node 运行时，Web UI 在其配置端口可访问（默认 `3080`）。
+- 能写入该实例的 **profile**（`node_modules` 与组合补丁 `cordis.patch.yml`）——通常在 `$DSH_HOME/profiles/<名称>/`。
+- **dsh web 端口没有被别的进程抢占**（若有第二个实例占着端口，重启 helper 会"让位"而不是拉起新进程）。
+- **裸跑（无 supervisor）建议挂外部守护**：只有*请求式*重启会通过 detached helper 自愈；意外被杀（helper 未武装时）没有重启者。优先用 `systemd` 的 `Restart=on-failure` 或容器重启策略（插件会以退出码 125 触发）。
+
+---
+
+## 安装
+
+### 方式 A —— 从 npm（发布后）
 
 ```bash
-cd "$DSH_HOME/profiles/<your-profile>"     # e.g. ~/.dsh/profiles/web
-pnpm add dsh-harness-restart               # or: npm install dsh-harness-restart
+cd "$DSH_HOME/profiles/<你的-profile>"      # 例如 ~/.dsh/profiles/web
+pnpm add dsh-harness-restart                 # 或：npm install dsh-harness-restart
 ```
 
-### Option B — offline / from a tarball
+### 方式 B —— 离线 / tarball
 
 ```bash
-cd "$DSH_HOME/profiles/<your-profile>"
+cd "$DSH_HOME/profiles/<你的-profile>"
 pnpm add ./dsh-harness-restart-0.1.0.tgz
-# or place the package directory directly:
+# 或直接把包目录放到：
 #   node_modules/dsh-harness-restart/
 ```
 
-### Enable the plugin row
+### 启用插件行
 
-Insert a row into the profile composition patch (`profiles/<name>/cordis.patch.yml`):
+在 profile 组合补丁（`profiles/<名称>/cordis.patch.yml`）里插入一行：
 
 ```yaml
 - insert:
     - id: harness-restart
       name: 'dsh-harness-restart'
-      config: {}          # defaults; see the configuration table below
+      config: {}          # 全部用默认值；完整参数见下表
 ```
 
-Then **restart dsh**, and open Settings → **“DSH 重启”**. Verify the file landed with:
+然后**重启 dsh**，打开 设置 → **「DSH 重启」**。可用以下命令确认装载成功：
 
 ```bash
-dsh --profile <your-profile> --dump-config | grep -A3 harness-restart
+dsh --profile <你的-profile> --dump-config | grep -A3 harness-restart
 ```
 
-Peer requirements (all satisfied by dsh ≥ 0.1.5 / 0.2.0, no extra install needed):
+peer 依赖（dsh ≥ 0.1.5 / 0.2.0 均满足，无需额外安装）：
 
 ```
 @deepseek-ai/cordis    ^4.0.2
@@ -85,98 +85,98 @@ react                  ^18.2.0
 
 ---
 
-## Configuration
+## 配置
 
-All keys are optional. Priority: **runtime overrides file** (`$DSH_HOME/dsh-harness-restart-v1.json`) > **patch config** (`cordis.patch.yml` row) > **defaults**. Out-of-range values are **rejected with an error** (never clamped); a corrupted overrides file falls back with visible `warnings` and never bricks startup.
+所有键均可选。优先级：**运行时覆盖文件**（`$DSH_HOME/dsh-harness-restart-v1.json`）> **组合配置**（`cordis.patch.yml` 行）> **默认值**。越界值**直接报错**（绝不钳制）；损坏的覆盖文件回退默认并给出可见 `warnings`，不会让启动失败。
 
-| Key | Default | Meaning |
+| 键 | 默认 | 含义 |
 |---|---|---|
-| `ai.restartEnabled` | `true` | Allow the AI to trigger restarts |
-| `ai.challengeEnabled` | `true` | Two-step challenge for AI restarts |
-| `ai.allowNow` | `false` | Allow AI to use `now` |
-| `ai.delayRangeMs` | `[180000, 3600000]` | AI `delay` window (3 min–1 h); out-of-range → error + recommended value (`ai.recommendDelayMs`, 5 min) |
-| `trigger.defaultTrigger` / `defaultDelayMs` | `delay` / `300000` | What a schedule hit fires with |
-| `schedule` | `[]` | `{id, kind: preset|script, preset?, args?, script?, enabled?}` — presets `now/delay/daily/weekly/immediate/waitSeconds/waitAllOrForce`; scripts run as full-trust code (strong warning + audit sha256) |
-| `preRestart` | `{mode:'waitAllOrForce', forceAfterMs:30000}` | `immediate` / `waitSeconds(N)` / `waitAllOrForce(-1 = forever)` |
+| `ai.restartEnabled` | `true` | 是否允许 AI 发起重启 |
+| `ai.challengeEnabled` | `true` | AI 发起需两段式挑战 |
+| `ai.allowNow` | `false` | 是否允许 AI 用 `now` |
+| `ai.delayRangeMs` | `[180000, 3600000]` | AI 的 `delay` 区间（3 分钟~1 小时）；越界 → 报错并给推荐值（`ai.recommendDelayMs`，5 分钟） |
+| `trigger.defaultTrigger` / `defaultDelayMs` | `delay` / `300000` | 调度命中后的默认触发方式 |
+| `schedule` | `[]` | `{id, kind: preset\|script, preset?, args?, script?, enabled?}` —— 预设 `now/delay/daily/weekly/immediate/waitSeconds/waitAllOrForce`；脚本按完全信任执行（强告警 + 审计 sha256） |
+| `preRestart` | `{mode:'waitAllOrForce', forceAfterMs:30000}` | `immediate` / `waitSeconds(N)` / `waitAllOrForce(-1=无限等)` |
 | `postRestart` | `{mode:'resumeAll'}` | `none` / `resumeRequester` / `resumeAll` |
-| `restartDelayMs` | `2000` | Grace before the old process exits (ms) |
-| `challengeTtlMs` | `300000` | Challenge token lifetime |
-| `bootRestoreDelayMs` | `60000` | First wait before progressive restore |
-| `restoreStaggerMs` | `5000` | One callback session every N ms afterwards |
-| `callbackUnackTimeoutMs` | `1800000` | Receipt timeout (30 min) → one reminder |
-| `simulateOnly` | `false` | Drill mode: no real restart (or env `DSH_RESTART_SIMULATE=1`) |
-| `notifyPrompt` / `continuePrompt` / `restorePrompt` | `【DSH 重启】…` | Prompts; `{minutes}` / `{cbId}` / `{description}` placeholders |
-| `logTailLines` | `300` | Log viewer tail size |
+| `restartDelayMs` | `2000` | 旧进程退出前缓冲（ms） |
+| `challengeTtlMs` | `300000` | 挑战 token 有效期 |
+| `bootRestoreDelayMs` | `60000` | 渐进恢复首个等待 |
+| `restoreStaggerMs` | `5000` | 之后每 N ms 唤醒一个回调会话 |
+| `callbackUnackTimeoutMs` | `1800000` | 回执超时（30 分钟）→ 提醒一次 |
+| `simulateOnly` | `false` | 演练模式：不真重启（或环境变量 `DSH_RESTART_SIMULATE=1`） |
+| `notifyPrompt` / `continuePrompt` / `restorePrompt` | `【DSH 重启】…` | 提示文案；占位符 `{minutes}` / `{cbId}` / `{description}` |
+| `logTailLines` | `300` | 日志查看器尾部行数 |
 
-Legacy v0.1.x flat keys (`aiRestartEnabled`, `restartPolicy`, `notifyWaitMs`, …) are accepted and translated automatically.
+旧版 v0.1.x 平铺键（`aiRestartEnabled`、`restartPolicy`、`notifyWaitMs` 等）自动兼容翻译。
 
 ---
 
 ## HTTP API
 
-All routes live under `/plugins/dsh-harness-restart`, guarded to **localhost / private subnets + same-origin**.
+所有路由位于 `/plugins/dsh-harness-restart` 之下，**仅限本机/私有网段 + 同源**访问。
 
-| Method | Path | Purpose |
+| 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/status` | pid, mode, config, pending, callbacks, supervisors, `simulate`, `lastConfigReloadAt` |
-| GET | `/config` | effective config + warnings |
-| POST | `/config` | write config (`{patch: {...}}`); strict validation |
-| POST | `/restart` | `{trigger:'now'|'delay', delayMs?}` → 202 waiting / 200 accepted / 409 single-flight |
-| POST | `/cancel` | cancel a waiting restart |
-| GET | `/check` | read-only preflight |
-| GET | `/log` | tail of the event log |
-| GET | `/log/open` | path of the event log |
+| GET | `/status` | pid、模式、配置、pending、回调、supervisors、`simulate`、`lastConfigReloadAt` |
+| GET | `/config` | 生效配置 + warnings |
+| POST | `/config` | 写配置（`{patch: {...}}`），严格校验 |
+| POST | `/restart` | `{trigger:'now'|'delay', delayMs?}` → 202 waiting / 200 accepted / 409 单飞行 |
+| POST | `/cancel` | 取消等待中的重启 |
+| GET | `/check` | 只读预检 |
+| GET | `/log` | 事件日志尾部 |
+| GET | `/log/open` | 事件日志路径 |
 
-Event log: `$DSH_HOME/dsh-harness-restart.log` — records `restart-waiting`, `restart-about-to-exit`, `restart-finalized`, `restart-simulated`, `restart-resumed`, `restore-step`, `callback-error`, `schedule-trigger`, `ai-restart-denied`, … one JSON per line.
-
----
-
-## Limitations (boundaries)
-
-- **Scope is the dsh process only.** The plugin restarts the dsh web process it runs in; it never restarts, touches, or manages any other system process or service.
-- **Crash without a supervisor does not self-heal.** In bare runs the detached helper is only armed during a *requested* restart (`/restart`, tools, schedule). If dsh is killed out of the blue (OOM, `kill -9`, power loss) before the helper exists, nothing relaunches it — run under systemd/container for crash resilience.
-- **Post-restart continuation depends on dsh’s own session persistence.** The plugin injects “continue” prompts (resume targets + registered callbacks); the underlying conversation history survives because dsh persists session logs. Sessions that cannot be revived (no live agent, no `sessionController`) are skipped and logged.
-- **Only registered/unfinished sessions are resumed.** `resumeAll` covers unfinished root sessions plus sub-agents (via `agents.list()`); other archived/closed sessions are not touched.
-- **One pending restart at a time (single-flight).** A concurrent second request returns `409` until the first is cancelled or finalized.
-- **AI restrictions are intentional.** AI cannot use `now` by default, `delay` must be within `ai.delayRangeMs`, and each AI restart needs the two-step challenge.
-- **Public/tunneled deployments lose probe routes.** Domain authorities are always rejected (`403`); the page auto-reopen and log-open fall back to the printed token URL.
-- **Drill mode does not produce a real restart.** `simulateOnly` runs the full event chain and restore flow in-process; nothing exits, and `/status` never shows a new pid.
-- **Helper logs live in `/tmp`** (`/tmp/dsh-harness-restart-<stamp>-<port>.{out,err}.log`) and may be cleaned by the OS across reboots; the definitive event trail is `$DSH_HOME/dsh-harness-restart.log`.
+事件日志：`$DSH_HOME/dsh-harness-restart.log` —— 记录 `restart-waiting` / `restart-about-to-exit` / `restart-finalized` / `restart-simulated` / `restart-resumed` / `restore-step` / `callback-error` / `schedule-trigger` / `ai-restart-denied` 等，一行一个 JSON。
 
 ---
 
-## Security
+## 边界与限制
 
-See [`SECURITY.md`](SECURITY.md) for the full threat model. Highlights:
-
-- **Route guard**: all mutation and read routes accept only loopback / private IP literals as `Host`, and require same-origin when an `Origin` is present; **domain authorities (incl. DNS-rebinding candidates) are always `403`**, never downgraded.
-- **AI tools**: two-step challenge (16-hex token, one-time, 5 min TTL) bound to the first-call arguments; `now` off for AI; out-of-range `delay` rejected with the recommended value.
-- **Config writes**: per-key strict validation (`validateConfigV1`); out-of-range values are rejected, never clamped; only the plugin’s own config namespace can be written.
-- **Script callbacks run with full trust** in the host process (`new Function`); they are never fetched remotely, are gated behind a strong warning at registration, carry an audit sha256 in the event log, and are individually disablable (`enabled: false`).
-- **Data written**: `$DSH_HOME/dsh-resume.json` (session ids, requester, registered callbacks, timestamp) and `$DSH_HOME/dsh-harness-restart.log` (events; may contain session ids and local paths) — both local to the harness user.
+- **只作用于 dsh 进程本身。** 插件只重启它所在的 dsh web 进程，不重启、不触碰、不管理任何其它系统进程或服务。
+- **无 supervisor 时崩溃不自愈。** 裸跑下 detached helper 只在*请求式*重启（`/restart`、工具、调度）时才挂载；如果 dsh 在 helper 就绪前意外被杀（OOM、`kill -9`、断电），没有东西会拉起它——崩溃韧性请交给 systemd / 容器。
+- **重启后继续依赖 dsh 自身的会话持久化。** 插件负责注入"继续"提示（恢复目标 + 已注册回调）；会话历史能保留是因为 dsh 持久化了会话日志。无法复活的会话（无 live agent、无 `sessionController`）会被跳过并记录。
+- **只恢复"未完成 + 已注册回调"的会话。** `resumeAll` 覆盖未完成根会话与子 agent（经 `agents.list()`）；其它归档/已关闭会话不干预。
+- **同一时刻只允许一个 pending 重启（单飞行）。** 并发第二个请求返回 `409`，直到第一个被取消或完成。
+- **AI 限制是有意的。** AI 默认不能用 `now`，`delay` 必须落在 `ai.delayRangeMs` 区间内，每次重启都要过两段式挑战。
+- **公开/隧道化部署会失去探针路由。** 域名 Host 一律 `403`；页面自动重开与日志打开退化为打印出的 token URL。
+- **演练模式不会产生真实重启。** `simulateOnly` 在进程内跑完整事件链与恢复流程，什么也不会退出，`/status` 不会出现新 pid。
+- **helper 日志在 `/tmp`**（`/tmp/dsh-harness-restart-<stamp>-<port>.{out,err}.log`），可能被系统在重启时清理；权威事件轨迹是 `$DSH_HOME/dsh-harness-restart.log`。
 
 ---
 
-## Testing (safe, does not touch a running dsh)
+## 安全
 
-The plugin restarts its own process — testing directly on a live instance is what we designed away.
+完整威胁模型见 [`SECURITY.md`](SECURITY.md)。要点：
+
+- **路由守卫**：所有读写路由只接受回环 / 私有 IP 字面量作为 `Host`，且带 `Origin` 时必须同源；**域名 Host（含 DNS 重绑定候选）一律 `403`**，绝不降级。
+- **AI 工具**：两段式挑战（16 位 hex token、一次性、5 分钟 TTL）绑定首次调用的参数；AI 关 `now`；越界 `delay` 拒绝并给推荐值。
+- **配置写入**：按键严格校验（`validateConfigV1`）；越界值拒绝、绝不钳制；只能写插件自己的配置命名空间。
+- **脚本回调以完全信任执行**（宿主进程内 `new Function`）；永不远端拉取、注册带强告警、事件日志带审计 sha256、单个可禁用（`enabled: false`）。
+- **写入的数据**：`$DSH_HOME/dsh-resume.json`（会话 id、发起者、已注册回调、时间戳）与 `$DSH_HOME/dsh-harness-restart.log`（事件；可能含会话 id 与本地路径）——都只属 harness 用户。
+
+---
+
+## 测试（安全，不碰运行中的 dsh）
+
+这个插件会重启自身进程——直接在线上测正是我们设计掉的事。
 
 ```bash
-npm run test          # pure logic + client contract (72 + 11 + 11 assertions, ms)
-npm run test:simulate # isolated instance, drill mode: full event chain, zero process deaths (11 checks)
-npm run test:e2e      # isolated instance incl. a REAL restart loop (10 checks)
-npm run test:chaos    # 9 fault-injection scenarios (kill -9, port squatted by non-dsh,
-                      # concurrent 409, helper file deleted, corrupt marker, corrupt config, drills…)
+npm run test          # 纯逻辑 + 客户端契约（72+11+11 断言，毫秒级）
+npm run test:simulate # 隔离实例演练：完整事件链、零进程死亡（11 项）
+npm run test:e2e      # 隔离实例含一次真实重启闭环（10 项）
+npm run test:chaos    # 9 个故障注入场景（kill -9 / 端口被非 dsh 抢占 / 并发 409 /
+                      # 删 helper 文件 / 损坏 marker / 损坏配置 / 演练等）
 ```
 
-Every isolated scenario uses a throwaway `DSH_HOME` under `/tmp`, a dedicated port, and a `trap` that always cleans up. Real-restart loops happen only against those **dummy instances**, never against the dsh you are using.
+每个隔离场景使用 `/tmp` 下的临时 `DSH_HOME`、独立端口，`trap` 必定清理。真实重启闭环只发生在这些**替身实例**上，绝不会动你在用的 dsh。
 
 ---
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT —— 见 [`LICENSE`](LICENSE)。
 
-## Security
+## 安全
 
-See [`SECURITY.md`](SECURITY.md).
+见 [`SECURITY.md`](SECURITY.md)。
