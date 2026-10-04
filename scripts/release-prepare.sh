@@ -35,6 +35,7 @@ RELEASE_PATHS=(
   .github/workflows
   scripts/release-check.mjs
   scripts/lib
+  docs/CHANGELOG.md
   .gitignore
 )
 
